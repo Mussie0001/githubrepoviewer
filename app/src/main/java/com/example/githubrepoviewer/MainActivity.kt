@@ -19,6 +19,7 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
 import retrofit2.Response
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
@@ -26,15 +27,15 @@ import retrofit2.http.GET
 import retrofit2.http.Path
 import retrofit2.http.Query
 
-// data class for a github repository
+// data class for a github repository (api integration using moshi)
 data class Repository(
     val id: Long,
     val name: String,
     val description: String?
 )
 
-// retrofit interface for github api
-interface GitHubApiService {
+// retrofit interface for github api (repositories endpoint)
+interface GitHubAPI {
     @GET("users/{username}/repos")
     suspend fun getRepos(
         @Path("username") username: String,
@@ -43,15 +44,15 @@ interface GitHubApiService {
     ): Response<List<Repository>>
 }
 
-// class to get repositories from github and check pagination
-class GitHubRemoteDataSource(private val api: GitHubApiService) {
-    // fetch repos and return a pair (list, hasMore flag)
+// class to fetch repositories from github and check pagination via the link header
+class FetchRepos(private val api: GitHubAPI) {
+    // fetch repos and return a pair (list of repos, hasMore flag)
     suspend fun fetchRepos(username: String, page: Int): Result<Pair<List<Repository>, Boolean>> {
         return try {
             val response = api.getRepos(username, page)
             if (response.isSuccessful) {
                 val repos = response.body() ?: emptyList()
-                // check link header for next page info
+                // check link header = indicating another page exists
                 val linkHeader = response.headers()["Link"]
                 val hasMore = linkHeader?.contains("rel=\"next\"") == true
                 Result.success(Pair(repos, hasMore))
@@ -64,73 +65,70 @@ class GitHubRemoteDataSource(private val api: GitHubApiService) {
     }
 }
 
-// ui state for the repo screen
-data class RepoUiState(
+// ui state to hold repository data, loading flag, error and more pages flag
+data class UiState(
     val repos: List<Repository> = emptyList(),
     val isLoading: Boolean = false,
     val error: String? = null,
     val hasMore: Boolean = false
 )
 
-// viewmodel to manage state and fetch data
-class GitHubRepoViewModel : androidx.lifecycle.ViewModel() {
-    private val _uiState = MutableStateFlow(RepoUiState())
-    val uiState: StateFlow<RepoUiState> = _uiState
+// viewmodel to manage state and fetch data with flow
+class GitHubState : androidx.lifecycle.ViewModel() {
+    private val _uiState = MutableStateFlow(UiState())
+    val uiState: StateFlow<UiState> = _uiState
 
-    // keep track of current page and username for pagination
     private var currentPage = 1
     private var currentUsername: String = ""
 
-    // set up moshi for json parsing
     private val moshi = Moshi.Builder()
         .add(KotlinJsonAdapterFactory())
         .build()
 
-    // set up retrofit with moshi
+    private val okHttpClient = OkHttpClient.Builder().build()
+
     private val retrofit = Retrofit.Builder()
         .baseUrl("https://api.github.com/")
+        .client(okHttpClient)
         .addConverterFactory(MoshiConverterFactory.create(moshi))
         .build()
 
-    private val api: GitHubApiService = retrofit.create(GitHubApiService::class.java)
-    private val dataSource = GitHubRemoteDataSource(api)
+    private val api: GitHubAPI = retrofit.create(GitHubAPI::class.java)
+    private val dataSource = FetchRepos(api)
 
-    // start a new search for repos
+    // start a new search for repos when the user submits a username
     fun searchRepos(username: String) {
-        // reset state for new search
         currentUsername = username
         currentPage = 1
-        _uiState.value = RepoUiState(isLoading = true)
+        _uiState.value = UiState(isLoading = true)
         viewModelScope.launch {
             val result = dataSource.fetchRepos(username, currentPage)
             result.fold(
                 onSuccess = { (repos, hasMore) ->
-                    _uiState.value = RepoUiState(
+                    _uiState.value = UiState(
                         repos = repos,
                         isLoading = false,
                         hasMore = hasMore
                     )
                 },
                 onFailure = { error ->
-                    _uiState.value = RepoUiState(isLoading = false, error = error.message)
+                    _uiState.value = UiState(isLoading = false, error = error.message)
                 }
             )
         }
     }
 
     // load the next page of repos
-    fun loadMore() {
+    fun loadNextPages() {
         if (_uiState.value.isLoading || !_uiState.value.hasMore) return
-
         _uiState.value = _uiState.value.copy(isLoading = true)
         currentPage++
         viewModelScope.launch {
             val result = dataSource.fetchRepos(currentUsername, currentPage)
             result.fold(
                 onSuccess = { (repos, hasMore) ->
-                    // add new repos to the current list
                     val updatedList = _uiState.value.repos + repos
-                    _uiState.value = RepoUiState(
+                    _uiState.value = UiState(
                         repos = updatedList,
                         isLoading = false,
                         hasMore = hasMore
@@ -144,23 +142,23 @@ class GitHubRepoViewModel : androidx.lifecycle.ViewModel() {
     }
 }
 
-// main activity that shows the ui
+// main activity to set the compose ui
 class MainActivity : ComponentActivity() {
-    private val viewModel: GitHubRepoViewModel by viewModels()
+    private val vm: GitHubState by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
             MaterialTheme {
-                GitHubRepoScreen(viewModel = viewModel)
+                RepoScreen(viewModel = vm)
             }
         }
     }
 }
 
 @Composable
-fun GitHubRepoScreen(viewModel: GitHubRepoViewModel) {
+fun RepoScreen(viewModel: GitHubState) {
     val uiState by viewModel.uiState.collectAsState()
     var username by remember { mutableStateOf("") }
 
@@ -169,9 +167,8 @@ fun GitHubRepoScreen(viewModel: GitHubRepoViewModel) {
             .fillMaxSize()
             .padding(16.dp)
     ) {
-        // add some top space
         Spacer(modifier = Modifier.height(32.dp))
-        // row with input field and search button
+        // input field and search button in a row for user input
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -189,7 +186,7 @@ fun GitHubRepoScreen(viewModel: GitHubRepoViewModel) {
         }
         Spacer(modifier = Modifier.height(16.dp))
 
-        // show error, loading, or repo list
+        // display error, loading, or repo list with proper state management
         when {
             uiState.error != null -> {
                 Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -203,19 +200,20 @@ fun GitHubRepoScreen(viewModel: GitHubRepoViewModel) {
             }
             uiState.repos.isEmpty() -> {
                 Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                    Text("No repositories to display. Please enter a username.")
+                    Text("no repositories to display. please enter a username.")
                 }
             }
             else -> {
+                // displays repository names and descriptions in a lazy column
                 LazyColumn(modifier = Modifier.weight(1f)) {
                     items(uiState.repos) { repo ->
-                        RepoItem(repo)
+                        RepoCard(repo)
                     }
                 }
-                // show load more button if there are more pages
+                // load more button for pagination
                 if (uiState.hasMore) {
                     Button(
-                        onClick = { viewModel.loadMore() },
+                        onClick = { viewModel.loadNextPages() },
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(vertical = 8.dp)
@@ -236,7 +234,7 @@ fun GitHubRepoScreen(viewModel: GitHubRepoViewModel) {
 }
 
 @Composable
-fun RepoItem(repo: Repository) {
+fun RepoCard(repo: Repository) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
